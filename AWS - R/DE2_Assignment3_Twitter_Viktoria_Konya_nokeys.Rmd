@@ -1,0 +1,346 @@
+---
+title: "DE2 - Assignment3"
+author: "Viktoria Konya"
+date: "24/11/2021"
+output: pdf_document
+---
+
+#### Set up Twitter API
+```{r}
+
+# Import Twitter library
+library(rtweet)
+
+# Authorization with access token/secret method
+api_key <- "XXX"
+api_secret_key <- "XXX"
+access_token <- "XXX"
+access_token_secret <- "XXX"
+
+## Create personal Twitter Token
+token <- create_token(
+  app = "MyApp",
+  consumer_key = api_key,
+  consumer_secret = api_secret_key,
+  access_token = access_token,
+  access_secret = access_token_secret)
+
+## Authorization in future R sessions
+get_token()
+
+```
+
+#### Set up AWS Connection
+```{r}
+
+# AWS Services
+library("aws.comprehend")
+library("aws.translate")
+library("aws.polly")
+
+keyfile = list.files(path=".", pattern="accessKeys.csv", full.names=TRUE)
+if (identical(keyfile, character(0))){
+  stop("ERROR: AWS key file not found")
+} 
+
+keyTable <- read.csv(keyfile, header = T) # 
+AWS_ACCESS_KEY_ID <- as.character(keyTable$Access.key.ID)
+AWS_SECRET_ACCESS_KEY <- as.character(keyTable$Secret.access.key)
+
+#activate
+Sys.setenv("AWS_ACCESS_KEY_ID" = AWS_ACCESS_KEY_ID,
+           "AWS_SECRET_ACCESS_KEY" = AWS_SECRET_ACCESS_KEY,
+           "AWS_DEFAULT_REGION" = "eu-west-1") 
+
+```
+
+
+```{r, echo = F, warnings = F, error = F}
+
+# Import additional required packages
+
+# Data Manipulation, cleaning and visualization
+library("tidyverse")
+library("textclean")
+library("lessR") 
+library("wordcloud")
+library("scales")
+library("tuneR") # to read out mp3
+
+```
+
+
+#### Get Twitter data
+```{r}
+
+# Get Tweets
+df <- search_tweets(q = "JoeBiden OR Biden",
+                    n = 18000, 
+                    include_rts = FALSE) # no retweets
+
+# Save dataset for future use
+saveRDS(df, file = "twitter_joe_biden.rds")
+
+```
+
+
+#### Data cleaning
+```{r}
+
+library("tidyverse")
+library("textclean")
+
+# Import dataset
+df <- readRDS(file = "twitter_joe_biden.rds")
+
+# Transformations
+df$text_orig <- df$text
+df$text <- gsub("@\\w+ *", "", df$text) # Delete all mentions
+df$text <- gsub('http\\S+\\s*', '', df$text) # Delete URLs
+df$text <- gsub("[]['!#$%()*,.:;<=>@^_`|~.{}]", "", df$text) # Delete special characters
+df$text <- gsub("\"", "", df$text) # Delete double quotation marks
+df$text <- sapply(df$text,function(row) iconv(row, "latin1", "ASCII", sub="")) # Delete all emojis
+df$text <- trimws(df$text) # Delete extra leading spaces
+df$text_wordnum <-lengths(gregexpr("\\W+", df$text)) + 1 # Calculate word count
+
+# Data cleaning
+df <- df %>% 
+  select(user_id, created_at, screen_name, text, source, lang, country, country_code, geo_coords, location, text_wordnum) %>%
+  filter(text_wordnum >= 5 )  %>% # Remove tweets with less than 5 words
+  filter(!is.na(text) & text != '')  %>% # Remove empty tweets
+  filter(!duplicated(paste0(user_id,created_at, text))) # Remove duplicates
+
+# Save clean dataset for future use 
+saveRDS(df, file = "twitter_joe_biden_clean.rds")
+
+```
+
+#### Translate non-English Tweets to English with AWS Translate
+```{r}
+
+# Create a subset with non-english Tweets
+df_translate <- df %>% filter(lang != 'en')
+
+# Iterate through the Tweets and translate them to English
+for (i in 1:nrow(df_translate)) {
+  df_translate$translated_text[i] = translate(df_translate[i,]$text, from = "auto", to = "en")
+}
+
+# Save dataset for future use
+saveRDS(df_translate, file = "twitter_joe_biden_translated.rds")
+
+# Join back translated Tweets to original dataset and overwrite the original Tweet with the translated Tweet
+df <- left_join(df, 
+            df_translate %>% select(user_id, created_at, text, translated_text), 
+            by = c("user_id" = "user_id", "created_at" = "created_at", "text" = "text")) %>% 
+      mutate(text = ifelse(is.na(translated_text), text, translated_text))
+
+```
+
+
+#### Detect sentiments of the Tweets with AWS Comprehend
+```{r}
+
+# Add empty columns to dataset
+df <- df  %>%
+  add_column(Sentiment = NA, 
+             Mixed = NA,
+             Negative = NA,
+             Neutral = NA,
+             Positive = NA)
+
+# Iterate through the Tweets and save the detected sentiment to the dataset
+for (i in 1:nrow(df)) {
+  
+  sentiment = detect_sentiment(df$text[i])
+  
+  df$Sentiment[i] = sentiment$Sentiment
+  df$Mixed[i] = sentiment$Mixed
+  df$Negative[i] = sentiment$Negative
+  df$Neutral[i] = sentiment$Neutral
+  df$Positive[i] = sentiment$Positive
+  
+}
+
+# Save dataset for future use
+saveRDS(df, file = "twitter_joe_biden_sentiments.rds")
+
+```
+
+
+#### Detect entities in the Tweets with AWS Comprehend
+```{r}
+
+# Create empty dataframe for entities data
+entities_all = data.frame(Index=integer(),
+                          BeginOffset=integer(),
+                          EndOffset=integer(),
+                          Score=double(),
+                          Text=character(),
+                          Type=character())
+
+# Iterate through the Tweets and save the detected entities to the placeholder table
+for (i in 1:nrow(df)) {
+  
+  entities_i = detect_entities(df$text[i])
+  
+  if (ncol(entities_i) != 6) {
+    entities_all <- entities_all
+  }else{
+    entities_i$Index = i
+    entities_all <- rbind(entities_all, entities_i)
+  }
+  
+}
+
+# Save dataset for future use
+saveRDS(entities_all, file = "twitter_joe_biden_entities.rds")
+
+```
+
+
+#### Detect phrases in the Tweets with AWS Comprehend
+```{r}
+
+# Create empty dataframe for phrases data
+phrases_all = data.frame(Index=integer(),
+                          BeginOffset=integer(),
+                          EndOffset=integer(),
+                          Score=double(),
+                          Text=character())
+
+# Iterate through the Tweets and save the detected phrases to the placeholder table
+for (i in 1:nrow(df)) {
+  
+  phrases_i = detect_phrases(df$text[i])
+  
+  if (ncol(phrases_i) != 5) {
+    phrases_all <- phrases_all
+  }else{
+    phrases_i$Index = i
+    phrases_all <- rbind(phrases_all, phrases_i)
+  }
+  
+}
+
+# Save dataset for future use
+saveRDS(phrases_all, file = "twitter_joe_biden_phrases.rds")
+
+```
+
+
+#### Sentiment Analysis
+```{r, meassages = F, warnings = F, error = F}
+
+library("lessR") 
+
+# Import dataset
+df <- readRDS(file = "twitter_joe_biden_sentiments.rds")
+
+
+# Pie chart with the proportion of Tweet sentiments
+PieChart(Sentiment, data = df,
+         hole = 0.7,
+         values_size=1.2,
+         fill = "viridis",
+         main = "Tweets by Sentiment")
+
+```
+
+```{r}
+
+# Tweets by positive versus negative sentiments 
+
+library("scales")
+
+ggplot(df) +
+  aes(x = Positive, y = Negative, colour = Sentiment) +
+  geom_point(shape = "circle", size = 1, alpha = 0.8) +
+  theme_bw()+
+  scale_y_continuous(limits = c(0, 1, by = 0.10), labels = percent) +
+  scale_x_continuous(limits = c(0, 1, by = 0.10), labels = percent) +
+  scale_color_viridis_d( begin = 0, end = 1) +
+  labs(title  = "Tweets in Positive versus Negative Coordinate system") +
+  theme(legend.position = "bottom")
+
+```
+
+
+##### Wordcloud with Phrases
+```{r}
+
+library("wordcloud")
+
+# Import dataset
+phrases_all <- readRDS(file = "twitter_joe_biden_phrases.rds")
+
+# Clean dataset with phrases
+phrases_all$Text_clean <- trimws(tolower(gsub('the', '', phrases_all$Text))) 
+phrases_all <- phrases_all %>%  filter(!Text_clean %in% c('biden','joe biden','joebiden', 'president biden'))
+
+
+# Create dataset for wordcloud
+my_data <- data.frame(text = phrases_all$Text_clean, freq = 1, stringsAsFactors = FALSE)
+
+# Aggregate dataset for visualization 
+my_agr <- aggregate(freq ~ ., data = my_data, sum)
+
+# Plot wordcloud
+wordcloud(words = my_agr$text, freq = my_agr$freq, min.freq = 50,
+          max.words=200, random.order=FALSE, rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"), scale = c(2, .5))
+
+
+```
+
+
+##### Wordcloud with Entities
+```{r}
+
+# Import dataset
+entities_all <- readRDS(file = "twitter_joe_biden_entities.rds")
+
+# Clean dataset with entities and filter for detected PERSON and ORGANIZATION types
+entities_all$Text_clean <- trimws(tolower(gsub('the', '', entities_all$Text)))
+entities_all <- entities_all %>% filter(Type %in% c('PERSON', 'ORGANIZATION'))
+entities_all <- entities_all %>%  filter(!Text_clean %in% c('biden','joe biden','joebiden', 'president biden'))
+
+# Create dataset for wordcloud
+my_data <- data.frame(text = entities_all$Text_clean, freq = 1, stringsAsFactors = FALSE)
+
+# Aggregate dataset for visualization 
+my_agr <- aggregate(freq ~ ., data = my_data, sum)
+
+# Plot wordcloud
+wordcloud(words = my_agr$text, freq = my_agr$freq, min.freq = 30,
+          max.words=200, random.order=FALSE, rot.per=0.35, 
+          colors=brewer.pal(8, "Dark2"), scale = c(2, .5))
+
+```
+
+
+##### Read out the most positive and negative Tweets
+```{r}
+
+library("tuneR")
+
+# Get 5 most positive and negative Tweets
+top_positive <- df %>% arrange(desc(Positive)) %>% head(5)
+top_negative <- df %>% arrange(desc(Negative)) %>% head(5)
+
+# Read out 4th most negative comment
+print(top_negative$text[4])
+
+ 
+neg <- synthesize(top_negative$text[4], voice = "Ivy")
+play(neg)
+
+
+# Read out 4th most positive comment
+print(top_positive$text[4])
+
+pos <- synthesize(top_positive$text[4], voice = "Raveena")
+play(pos)
+
+```
+
