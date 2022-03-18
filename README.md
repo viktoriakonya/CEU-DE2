@@ -1,5 +1,5 @@
 # CEU-DE2
-This is a repository for my DA2 assignments.
+This is a repository for my DE2 assignments.
 
 Couse materials are in this repo: **ceu-cloud-class**
 
